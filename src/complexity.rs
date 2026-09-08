@@ -65,6 +65,45 @@ const REASONING_KEYWORDS: &[&str] = &[
     "design a system",
 ];
 
+/// Vérifie que `keyword` apparaît dans `haystack` sur une frontière de mot
+/// (ni précédé ni suivi d'un caractère alphanumérique), plutôt que comme
+/// simple sous-chaîne. Voir le commentaire sur le signal "mot_cle_raisonnement"
+/// pour l'exemple concret ("prove" dans "improve") que ça corrige.
+///
+/// Ceci reste une heuristique de surface : elle empêche les faux positifs
+/// par sous-chaîne, mais pas le jeu délibéré — un prompt trivial qui
+/// mentionne isolément un des mots-clés ("un vrai trade-off, ce dîner")
+/// gagne quand même les 0.25 points, et un prompt réellement complexe qui
+/// évite soigneusement tous les mots de la liste peut ne déclencher aucun
+/// signal. Voir "Limites connues" dans le README.
+fn contains_word(haystack: &str, keyword: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel_pos) = haystack[search_from..].find(keyword) {
+        let match_start = search_from + rel_pos;
+        let match_end = match_start + keyword.len();
+
+        let before_is_boundary = haystack[..match_start]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        let after_is_boundary = haystack[match_end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+
+        if before_is_boundary && after_is_boundary {
+            return true;
+        }
+        search_from = match_start + 1;
+        if search_from >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Analyse un prompt et retourne son score de complexité (0.0 = trivial,
 /// 1.0 = très complexe) accompagné du détail des signaux.
 pub fn analyze(prompt: &str) -> ComplexityScore {
@@ -90,7 +129,14 @@ pub fn analyze(prompt: &str) -> ComplexityScore {
     };
 
     // Signal 3 : mots-clés associés à un raisonnement multi-étapes.
-    let has_reasoning_keyword = REASONING_KEYWORDS.iter().any(|kw| lower.contains(kw));
+    // `contains_word` (frontière de mot), pas `str::contains` : sans ça,
+    // "prove" matchait à l'intérieur de "improve" (mot anglais très courant,
+    // sans rapport avec un raisonnement multi-étapes) et "optimi" à
+    // l'intérieur de "optimisme" — un seul mot ordinaire suffisait alors à
+    // déclencher artificiellement les 0.25 points du signal.
+    let has_reasoning_keyword = REASONING_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&lower, kw));
     let reasoning_signal = ComplexitySignal {
         name: "mot_cle_raisonnement",
         weight: 0.25,
@@ -191,5 +237,34 @@ mod tests {
     fn numeric_heavy_prompt_is_flagged() {
         let result = analyze("2+2=4, 3*3=9, 10/2=5, 7-1=6");
         assert!(result.triggered_signals().contains(&"densite_numerique"));
+    }
+
+    #[test]
+    fn common_word_containing_a_keyword_substring_does_not_falsely_trigger() {
+        // "improve" contient "prove" ; "optimisme" contient "optimi". Avant
+        // le passage à une comparaison sur frontière de mot, ces deux mots
+        // ordinaires suffisaient à déclencher artificiellement le signal
+        // "mot_cle_raisonnement" (+0.25) sur un prompt par ailleurs trivial.
+        let result = analyze("Can you improve this a bit? Je reste dans l'optimisme.");
+        assert!(
+            !result.triggered_signals().contains(&"mot_cle_raisonnement"),
+            "faux positif : {:?}",
+            result.signals
+        );
+    }
+
+    #[test]
+    fn actual_reasoning_keyword_still_triggers_at_a_word_boundary() {
+        // Non-régression : la correction de frontière de mot ne doit pas
+        // rendre les vrais mots-clés inopérants (ponctuation, casse,
+        // début/fin de chaîne).
+        let result = analyze("Please prove this theorem.");
+        assert!(result.triggered_signals().contains(&"mot_cle_raisonnement"));
+
+        let result = analyze("prove");
+        assert!(result.triggered_signals().contains(&"mot_cle_raisonnement"));
+
+        let result = analyze("Explique pourquoi le ciel est bleu.");
+        assert!(result.triggered_signals().contains(&"mot_cle_raisonnement"));
     }
 }

@@ -156,22 +156,41 @@ impl Router {
 
         let mut forced_by_budget = false;
         if let Some(budget) = self.config.daily_budget_usd {
+            // On ne s'arrête pas dès que le coût projeté rentre dans le
+            // budget : il faut *aussi* que la route atterrie soit saine.
+            // Avant ce correctif, la boucle ne regardait que le coût et
+            // pouvait donc router silencieusement vers une route dont le
+            // disjoncteur est ouvert simplement parce qu'elle est moins
+            // chère — ce que `first_healthy_from` évite pourtant
+            // soigneusement pour le choix de base. Le local (index 0)
+            // reste l'ultime recours même dégradé, comme partout ailleurs
+            // dans ce module : il n'existe rien de plus bas vers quoi replier.
             while route_index > 0 {
                 let projected = self.pricing.cost_for(
                     ROUTE_TIERS[route_index],
                     tokens_in,
                     ASSUMED_OUTPUT_TOKENS,
                 );
-                if spent_today_usd + projected > budget {
+                let over_budget = spent_today_usd + projected > budget;
+                let unhealthy = !self.is_route_healthy(ROUTE_TIERS[route_index]);
+                if !over_budget && !unhealthy {
+                    break;
+                }
+                if over_budget {
                     forced_by_budget = true;
                     reasons.push(format!(
                         "budget quotidien ({budget:.2}$) dépassé par « {} » (déjà {spent_today_usd:.2}$ dépensés) → repli sur « {} »",
                         ROUTE_TIERS[route_index], ROUTE_TIERS[route_index - 1]
                     ));
-                    route_index -= 1;
-                } else {
-                    break;
                 }
+                if unhealthy {
+                    reasons.push(format!(
+                        "« {} » indisponible/dégradé (repli budgétaire) → repli sur « {} »",
+                        ROUTE_TIERS[route_index],
+                        ROUTE_TIERS[route_index - 1]
+                    ));
+                }
+                route_index -= 1;
             }
         }
 
@@ -509,6 +528,50 @@ mod tests {
         }
         assert!(router.success_rate("local") > 0.9);
         let decision = router.decide("Salut", 0.0);
+        assert_eq!(decision.route, "local");
+    }
+
+    #[test]
+    fn budget_downgrade_skips_a_route_whose_breaker_is_open() {
+        // Avant le correctif, le repli budgétaire ne regardait que le coût
+        // projeté : si "paid-cheap" tombait pile dans le budget mais que son
+        // disjoncteur était ouvert, la décision y routait quand même,
+        // silencieusement, au lieu de continuer à descendre vers "local".
+        // Budget choisi pour que "paid-cheap" soit largement abordable
+        // (~0.32$) mais "paid-premium" ne le soit pas (~5$+) : un repli
+        // budgétaire seul s'arrêterait donc normalement sur "paid-cheap".
+        let config = AutopilotConfig {
+            daily_budget_usd: Some(1.0),
+            ..AutopilotConfig::default()
+        };
+        let mut router = router_with(config);
+        for _ in 0..10 {
+            router.record_outcome("paid-cheap", false);
+        }
+        assert!(!router.stats_for("paid-cheap").is_available());
+
+        let prompt =
+            "Explique pourquoi, étape par étape, cet algorithme est incorrect ```code```. \
+                       Compromis ? Architecture ? Preuve ?";
+        let decision = router.decide(prompt, 0.0);
+        assert_eq!(decision.route, "local");
+    }
+
+    #[test]
+    fn budget_downgrade_still_lands_on_local_even_if_its_breaker_is_open() {
+        // Local reste le dernier recours : même dégradé, il n'existe rien de
+        // plus bas vers quoi replier (comportement documenté et inchangé).
+        let config = AutopilotConfig {
+            daily_budget_usd: Some(0.0),
+            ..AutopilotConfig::default()
+        };
+        let mut router = router_with(config);
+        for _ in 0..10 {
+            router.record_outcome("local", false);
+        }
+        assert!(!router.stats_for("local").is_available());
+
+        let decision = router.decide("prompt trivial", 0.0);
         assert_eq!(decision.route, "local");
     }
 }

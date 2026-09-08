@@ -159,7 +159,24 @@ appels consécutifs.
   modèle appris : il capture des signaux de surface (mots-clés, longueur,
   code, questions multiples) et peut se tromper sur un prompt qui déjoue ces
   heuristiques (une question triviale très longue, ou une tâche complexe
-  formulée en une phrase courte).
+  formulée en une phrase courte). Le signal de mots-clés compare sur une
+  frontière de mot (pas une simple sous-chaîne — "prove" ne matche plus dans
+  "improve"), mais reste gameable en substance : un prompt trivial qui
+  mentionne isolément un des mots-clés ("un vrai trade-off, ce dîner")
+  gagne quand même les 0.25 points du signal, et un prompt réellement
+  complexe qui évite soigneusement tous les mots de la liste peut ne
+  déclencher aucun signal de raisonnement. C'est une limite inhérente à une
+  liste de mots-clés, pas un bug de correspondance.
+- Le disjoncteur redonne un point de départ optimiste (EMA à 1.0, compteur
+  d'échantillons à zéro) à une route qui vient de se refermer après un essai
+  réussi en semi-ouvert — sans ça, un seul nouvel échec juste après la
+  fermeture suffisait à la rouvrir immédiatement, l'historique d'échecs
+  précédent restant présent dans la moyenne mobile.
+- Le repli budgétaire (`daily_budget_usd`) respecte maintenant aussi la
+  santé des routes en descendant les paliers : il ne s'arrête plus sur une
+  route moins chère mais dont le disjoncteur est ouvert. Le local reste
+  toutefois un dernier recours accepté même dégradé, faute d'un palier plus
+  bas vers lequel replier.
 - Les tarifs de `PricingTable::example_default` sont indicatifs (ordre de
   grandeur mi-2026) — à ajuster à tes propres contrats fournisseur avant de
   faire confiance aux montants affichés.

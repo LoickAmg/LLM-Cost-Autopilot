@@ -88,13 +88,24 @@ impl RouteStats {
         match self.state {
             BreakerState::HalfOpen => {
                 // L'essai décide : succès referme, échec relance le repos.
-                self.state = if success {
-                    BreakerState::Closed
+                if success {
+                    self.state = BreakerState::Closed;
+                    // Sans ce reset, l'EMA reste plombée par la série
+                    // d'échecs qui a précédé l'ouverture et `samples`
+                    // dépasse déjà `min_samples_before_trip` : un seul
+                    // nouvel échec suffirait alors à rouvrir immédiatement
+                    // le disjoncteur (la route n'aurait droit qu'à UN
+                    // succès de grâce avant de retomber en essai perpétuel,
+                    // sans jamais repasser vraiment "fermé"). On lui
+                    // redonne le même point de départ optimiste qu'une
+                    // route neuve.
+                    self.success_rate_ema = 1.0;
+                    self.samples = 0;
                 } else {
-                    BreakerState::Open {
+                    self.state = BreakerState::Open {
                         opened_at: Instant::now(),
-                    }
-                };
+                    };
+                }
             }
             BreakerState::Closed => {
                 if self.samples >= self.min_samples_before_trip
@@ -190,5 +201,51 @@ mod tests {
             stats.record(true);
         }
         assert!(stats.success_rate() > after_failures);
+    }
+
+    #[test]
+    fn closing_after_recovery_resets_ema_and_sample_count() {
+        // Avant le correctif : après une réouverture (10 échecs puis un
+        // succès en semi-ouvert), l'EMA restait plombée par l'historique et
+        // `samples` dépassait déjà `min_samples_before_trip` — la route
+        // n'avait droit qu'à UN succès de grâce avant qu'un seul nouvel
+        // échec ne la rouvre immédiatement.
+        let mut stats = RouteStats::new(0.5, Duration::from_millis(10));
+        for _ in 0..10 {
+            stats.record(false);
+        }
+        assert!(stats.is_open());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(stats.is_available()); // passe en semi-ouvert
+        stats.record(true); // l'essai réussit, referme le disjoncteur
+
+        assert!(!stats.is_open());
+        assert_eq!(
+            stats.success_rate(),
+            1.0,
+            "l'EMA doit repartir de zéro après une fermeture, pas rester plombée"
+        );
+        assert_eq!(
+            stats.samples(),
+            0,
+            "le compteur d'échantillons doit repartir de zéro après une fermeture"
+        );
+    }
+
+    #[test]
+    fn a_single_failure_right_after_recovery_does_not_immediately_reopen() {
+        let mut stats = RouteStats::new(0.5, Duration::from_millis(10));
+        for _ in 0..10 {
+            stats.record(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(stats.is_available());
+        stats.record(true); // referme, avec le reset du correctif
+
+        stats.record(false); // un seul échec juste après la fermeture
+        assert!(
+            !stats.is_open(),
+            "un seul échec ne doit pas suffire à rouvrir juste après une fermeture fraîche"
+        );
     }
 }
